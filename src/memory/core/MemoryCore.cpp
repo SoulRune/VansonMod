@@ -220,6 +220,7 @@ static bool matchGroupItemValue(const void *ptr, const GroupItem &item,
 MemoryCore::MemoryCore() : _pid(0), _task(MACH_PORT_NULL), _resultLimit(0), _floatTolerance(0.001), _groupSearchRange(200), _groupAnchorMode(false) {}
 
 MemoryCore::~MemoryCore() {
+  clearFastFuzzySnapshot();
   if (_task != MACH_PORT_NULL) {
     mach_port_deallocate(mach_task_self(), _task);
   }
@@ -1341,6 +1342,7 @@ void MemoryCore::setStoragePath(const std::string &path,
                                 const std::string &swapPath) {
   _storagePath = path;
   _swapPath = swapPath;
+  _fastFuzzySnapshotPath = path + ".fuzzy";
 }
 
 std::vector<ScanResult>
@@ -2785,63 +2787,92 @@ search_done:
 }
 
 void MemoryCore::fastFuzzyInit() {
-  
-  _fastFuzzySnapshot.clear();
-  _fastFuzzySnapshot.shrink_to_fit();
-  
+
+  clearFastFuzzySnapshot();
+
   if (_task == MACH_PORT_NULL) return;
-  
+
+  if (_fastFuzzySnapshotPath.empty()) {
+    _fastFuzzySnapshotPath = _storagePath + ".fuzzy";
+  }
+  if (_fastFuzzySnapshotPath.empty()) return;
+
+  FILE *snapshotFile = fopen(_fastFuzzySnapshotPath.c_str(), "wb");
+  if (!snapshotFile) return;
+
+  _fastFuzzyAddressCount = 0;
   const uint64_t endAddress = 0x800000000;
-  
   mach_vm_address_t address = 0x100000000;
   uint64_t totalCaptured = 0;
-  const uint64_t maxTotalSize = 1024 * 1024 * 1024;  
-  
+  const uint64_t maxTotalSize = 8ULL * 1024 * 1024 * 1024;
+  const size_t chunkBufferSize = 32ULL * 1024 * 1024;
+
   while (address < endAddress && totalCaptured < maxTotalSize) {
     mach_vm_size_t size = 0;
     uint32_t depth = 0;
     mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
     vm_region_submap_info_data_64_t info;
-    
+
     kern_return_t kr = mach_vm_region_recurse(
         _task, &address, &size, &depth,
         (vm_region_recurse_info_t)&info, &count);
     if (kr != KERN_SUCCESS) break;
-    
+
     if ((info.protection & VM_PROT_READ) && (info.protection & VM_PROT_WRITE)) {
-      if (size <= 200 * 1024 * 1024) {  
-        SnapshotRegion region;
-        region.start = address;
-        region.data.resize(size);
-        mach_vm_size_t readSize = size;
-        if (mach_vm_read_overwrite(_task, address, size,
-                                   (mach_vm_address_t)region.data.data(),
-                                   &readSize) == KERN_SUCCESS) {
-          region.size = (uint32_t)readSize;
-          if (readSize != size) region.data.resize(readSize);
-          _fastFuzzySnapshot.push_back(std::move(region));
-          totalCaptured += readSize;
+      uint64_t regionStart = address;
+      uint64_t regionEnd = std::min<uint64_t>(address + size, endAddress);
+      for (uint64_t cursor = regionStart;
+           cursor < regionEnd && totalCaptured < maxTotalSize;) {
+        uint64_t remainingRegion = regionEnd - cursor;
+        uint64_t remainingBudget = maxTotalSize - totalCaptured;
+        size_t chunkSize = (size_t)std::min<uint64_t>(
+            std::min<uint64_t>(remainingRegion, remainingBudget),
+            chunkBufferSize);
+        if (chunkSize == 0) break;
+
+        std::vector<uint8_t> buffer(chunkSize);
+        mach_vm_size_t readSize = chunkSize;
+        if (mach_vm_read_overwrite(_task, cursor, chunkSize,
+                                   (mach_vm_address_t)buffer.data(),
+                                   &readSize) == KERN_SUCCESS && readSize > 0) {
+          uint64_t fileOffset = (uint64_t)ftello(snapshotFile);
+          size_t written = fwrite(buffer.data(), 1, (size_t)readSize, snapshotFile);
+          if (written == (size_t)readSize) {
+            FastFuzzySnapshotRegion region;
+            region.start = cursor;
+            region.size = (uint64_t)readSize;
+            region.fileOffset = fileOffset;
+            _fastFuzzySnapshot.push_back(region);
+            if (readSize >= 4) {
+              _fastFuzzyAddressCount += (size_t)readSize - 3;
+            }
+            totalCaptured += readSize;
+          }
         }
+        cursor += chunkSize;
       }
     }
     address += size;
+  }
+
+  fclose(snapshotFile);
+
+  if (_fastFuzzySnapshot.empty()) {
+    std::remove(_fastFuzzySnapshotPath.c_str());
   }
 }
 
 void MemoryCore::clearFastFuzzySnapshot() {
   _fastFuzzySnapshot.clear();
   _fastFuzzySnapshot.shrink_to_fit();
+  _fastFuzzyAddressCount = 0;
+  if (!_fastFuzzySnapshotPath.empty()) {
+    std::remove(_fastFuzzySnapshotPath.c_str());
+  }
 }
 
 size_t MemoryCore::getFastFuzzyAddressCount() const {
-  
-  size_t totalAddresses = 0;
-  for (const auto& region : _fastFuzzySnapshot) {
-    if (region.size >= 4) {
-      totalAddresses += (region.size - 3);  
-    }
-  }
-  return totalAddresses;
+  return _fastFuzzyAddressCount;
 }
 
 std::vector<ScanResult> MemoryCore::fastFuzzyFilter(DataType type, int filterMode,
@@ -3000,92 +3031,100 @@ std::vector<ScanResult> MemoryCore::fastFuzzyFilter(DataType type, int filterMod
   } else {
     
     const uint64_t endAddress = 0x800000000;
-    
-    std::vector<std::vector<RawResult>> perRegionResults(_fastFuzzySnapshot.size());
-    std::vector<std::vector<RawResult>> *perRegionResultsPtr = &perRegionResults;
-    const std::vector<SnapshotRegion> *snapshotPtr = &_fastFuzzySnapshot;
     uint64_t startAddr = start;
     uint64_t endAddr = endAddress;
-    
-    dispatch_apply(
-        _fastFuzzySnapshot.size(),
-        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0),
-        ^(size_t regionIdx) {
-          const SnapshotRegion &oldRegion = (*snapshotPtr)[regionIdx];
-          
-          if (oldRegion.start >= endAddr) return;
-          uint64_t regionEnd = oldRegion.start + oldRegion.size;
-          if (regionEnd <= startAddr) return;
-          
-          std::vector<uint8_t> currentData(oldRegion.size);
-          mach_vm_size_t readSize = oldRegion.size;
-          if (mach_vm_read_overwrite(task, oldRegion.start, oldRegion.size,
-                                     (mach_vm_address_t)currentData.data(),
-                                     &readSize) != KERN_SUCCESS) {
-            return;
-          }
-          
-          std::vector<RawResult> &localResults = (*perRegionResultsPtr)[regionIdx];
-          localResults.reserve(10000);
-          
-          size_t compareSize = std::min((size_t)oldRegion.size, (size_t)readSize);
-          if (compareSize < dSizeLocal) return;
-          
-          const uint8_t *oldData = oldRegion.data.data();
-          const uint8_t *newData = currentData.data();
-          
-          for (size_t offset = 0; offset + dSizeLocal <= compareSize; offset += dSizeLocal) {
-            uint64_t addr = oldRegion.start + offset;
-            if (addr < startAddr || addr >= endAddr) continue;
-            
-            bool match = false;
-            uint64_t newValBits = 0;
-            
-            if (isFloatType) {
-              double oldVal = 0, newVal = 0;
-              if (isFloat) {
-                oldVal = *(float *)(oldData + offset);
-                newVal = *(float *)(newData + offset);
-                memcpy(&newValBits, newData + offset, 4);
-              } else {
-                oldVal = *(double *)(oldData + offset);
-                newVal = *(double *)(newData + offset);
-                memcpy(&newValBits, newData + offset, 8);
-              }
-              
-              if (filterModeLocal == 0) match = (newVal < oldVal - floatTolerance);
-              else if (filterModeLocal == 1) match = (newVal > oldVal + floatTolerance);
-              else if (filterModeLocal == 5) match = (fabs(newVal - oldVal) > floatTolerance);
-              else if (filterModeLocal == 6) match = (fabs(newVal - oldVal) <= floatTolerance);
-            } else {
-              int64_t oldVal = 0, newVal = 0;
-              switch (dSizeLocal) {
-                case 1: oldVal = *(int8_t *)(oldData + offset); newVal = *(int8_t *)(newData + offset); break;
-                case 2: oldVal = *(int16_t *)(oldData + offset); newVal = *(int16_t *)(newData + offset); break;
-                case 8: oldVal = *(int64_t *)(oldData + offset); newVal = *(int64_t *)(newData + offset); break;
-                default: oldVal = *(int32_t *)(oldData + offset); newVal = *(int32_t *)(newData + offset); break;
-              }
-              
-              memcpy(&newValBits, newData + offset, dSizeLocal > 8 ? 8 : dSizeLocal);
-              
-              if (filterModeLocal == 0) match = (newVal < oldVal);
-              else if (filterModeLocal == 1) match = (newVal > oldVal);
-              else if (filterModeLocal == 5) match = (newVal != oldVal);
-              else if (filterModeLocal == 6) match = (newVal == oldVal);
-            }
-            
-            if (match) {
-              localResults.push_back(makeRawResult(addr, newValBits, type));
-            }
-          }
-        });
-    
-    for (const auto &localResults : perRegionResults) {
+
+    FILE *snapshotFile = fopen(_fastFuzzySnapshotPath.c_str(), "rb");
+    if (!snapshotFile) {
+      fclose(outFile);
+      return emptyRes;
+    }
+
+    std::vector<RawResult> localResults;
+    localResults.reserve(65536);
+    auto flushLocalResults = [&]() {
       if (!localResults.empty()) {
         fwrite(localResults.data(), sizeof(RawResult), localResults.size(), outFile);
         newResultCount += localResults.size();
+        localResults.clear();
+      }
+    };
+
+    for (const auto &oldRegion : _fastFuzzySnapshot) {
+      if (oldRegion.start >= endAddr) continue;
+      uint64_t regionEnd = oldRegion.start + oldRegion.size;
+      if (regionEnd <= startAddr) continue;
+      if (oldRegion.size < dSizeLocal) continue;
+
+      std::vector<uint8_t> oldData((size_t)oldRegion.size);
+      std::vector<uint8_t> currentData((size_t)oldRegion.size);
+      if (fseeko(snapshotFile, (off_t)oldRegion.fileOffset, SEEK_SET) != 0) continue;
+      size_t oldRead = fread(oldData.data(), 1, (size_t)oldRegion.size, snapshotFile);
+      if (oldRead == 0) continue;
+
+      mach_vm_size_t readSize = oldRegion.size;
+      if (mach_vm_read_overwrite(task, oldRegion.start, oldRegion.size,
+                                 (mach_vm_address_t)currentData.data(),
+                                 &readSize) != KERN_SUCCESS) {
+        continue;
+      }
+
+      size_t compareSize = std::min(oldRead, (size_t)readSize);
+      if (compareSize < dSizeLocal) continue;
+
+      const uint8_t *oldBytes = oldData.data();
+      const uint8_t *newBytes = currentData.data();
+
+      for (size_t offset = 0; offset + dSizeLocal <= compareSize; offset += dSizeLocal) {
+        uint64_t addr = oldRegion.start + offset;
+        if (addr < startAddr || addr >= endAddr) continue;
+
+        bool match = false;
+        uint64_t newValBits = 0;
+
+        if (isFloatType) {
+          double oldVal = 0, newVal = 0;
+          if (isFloat) {
+            oldVal = *(float *)(oldBytes + offset);
+            newVal = *(float *)(newBytes + offset);
+            memcpy(&newValBits, newBytes + offset, 4);
+          } else {
+            oldVal = *(double *)(oldBytes + offset);
+            newVal = *(double *)(newBytes + offset);
+            memcpy(&newValBits, newBytes + offset, 8);
+          }
+
+          if (filterModeLocal == 0) match = (newVal < oldVal - floatTolerance);
+          else if (filterModeLocal == 1) match = (newVal > oldVal + floatTolerance);
+          else if (filterModeLocal == 5) match = (fabs(newVal - oldVal) > floatTolerance);
+          else if (filterModeLocal == 6) match = (fabs(newVal - oldVal) <= floatTolerance);
+        } else {
+          int64_t oldVal = 0, newVal = 0;
+          switch (dSizeLocal) {
+            case 1: oldVal = *(int8_t *)(oldBytes + offset); newVal = *(int8_t *)(newBytes + offset); break;
+            case 2: oldVal = *(int16_t *)(oldBytes + offset); newVal = *(int16_t *)(newBytes + offset); break;
+            case 8: oldVal = *(int64_t *)(oldBytes + offset); newVal = *(int64_t *)(newBytes + offset); break;
+            default: oldVal = *(int32_t *)(oldBytes + offset); newVal = *(int32_t *)(newBytes + offset); break;
+          }
+
+          memcpy(&newValBits, newBytes + offset, dSizeLocal > 8 ? 8 : dSizeLocal);
+
+          if (filterModeLocal == 0) match = (newVal < oldVal);
+          else if (filterModeLocal == 1) match = (newVal > oldVal);
+          else if (filterModeLocal == 5) match = (newVal != oldVal);
+          else if (filterModeLocal == 6) match = (newVal == oldVal);
+        }
+
+        if (match) {
+          localResults.push_back(makeRawResult(addr, newValBits, type));
+          if (localResults.size() >= 65536) {
+            flushLocalResults();
+          }
+        }
       }
     }
+    flushLocalResults();
+    fclose(snapshotFile);
   }
   
   fclose(outFile);

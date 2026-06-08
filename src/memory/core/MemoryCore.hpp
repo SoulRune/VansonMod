@@ -195,6 +195,12 @@ public:
     uint64_t oldValue;
     uint64_t newValue;
   };
+
+  struct FastFuzzySnapshotRegion {
+    uint64_t start;
+    uint64_t size;
+    uint64_t fileOffset;
+  };
   
   void fastFuzzyInit();  
   size_t getFastFuzzyAddressCount() const;  
@@ -229,11 +235,13 @@ private:
 
   std::string _storagePath;
   std::string _swapPath;
+  std::string _fastFuzzySnapshotPath;
   size_t _resultCount = 0;
+  size_t _fastFuzzyAddressCount = 0;
   
   std::vector<SnapshotRegion> _baselineSnapshot;
   
-  std::vector<SnapshotRegion> _fastFuzzySnapshot;
+  std::vector<FastFuzzySnapshotRegion> _fastFuzzySnapshot;
 
   std::vector<SnapshotRegion> _snapshot;
 
