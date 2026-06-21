@@ -1274,13 +1274,18 @@ MemoryCore::nextScan(const std::vector<ScanResult> &ignored, DataType type,
       
       if (actualRead == newCount && newCount > 1) {
         
-        std::unordered_set<uint64_t> seenAddresses;
+        // Dedup by (address + type): the same address may legitimately appear
+        // under several types in multi-type search - keep each distinct type
+        // instead of collapsing everything to the first-scanned one.
+        std::unordered_set<uint64_t> seenKeys;
         std::vector<RawResult> uniqueResults;
         uniqueResults.reserve(newCount);
-        
+
         for (const auto &res : allResults) {
-          if (seenAddresses.find(res.address) == seenAddresses.end()) {
-            seenAddresses.insert(res.address);
+          uint64_t key = (res.address & 0x00FFFFFFFFFFFFFFULL) |
+                         ((uint64_t)res.type << 56);
+          if (seenKeys.find(key) == seenKeys.end()) {
+            seenKeys.insert(key);
             uniqueResults.push_back(res);
           }
         }

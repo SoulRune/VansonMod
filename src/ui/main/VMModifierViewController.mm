@@ -1596,10 +1596,23 @@ static NSString *VMShortTypeName(VMDataType t) {
   }
   if ([t containsString:@"."])
     return @[ @(VMDataTypeFloat), @(VMDataTypeDouble) ];
-  return @[
-    @(VMDataTypeInt8), @(VMDataTypeInt16), @(VMDataTypeInt32), @(VMDataTypeInt64),
-    @(VMDataTypeUInt8), @(VMDataTypeUInt16), @(VMDataTypeUInt32), @(VMDataTypeUInt64)
-  ];
+
+  // Integer: pick ONE width by magnitude/sign. Including i8/i16 etc. is harmful:
+  // for a value like 100 the same address matches i8/i16/i32 at once, and dedup
+  // (by address) then collapses everything to the first-scanned type (i8).
+  // Float is added separately - its bytes never overlap an integer match.
+  BOOL negative = [t hasPrefix:@"-"];
+  long long sv = [t longLongValue];  // stops at separators; clamps on overflow
+  VMDataType intType;
+  if (sv >= -2147483648LL && sv <= 2147483647LL)
+    intType = VMDataTypeInt32;
+  else if (!negative && sv <= 4294967295LL)
+    intType = VMDataTypeUInt32;
+  else if (!negative && sv == 9223372036854775807LL)  // longLongValue overflow → uint64
+    intType = VMDataTypeUInt64;
+  else
+    intType = VMDataTypeInt64;
+  return @[ @(intType), @(VMDataTypeFloat) ];
 }
 
 // One representative type is for single-type operations (fast-fuzzy, group,
