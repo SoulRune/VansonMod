@@ -2,7 +2,7 @@
 #import "include/VMLocalization.h"
 
 #define TR(key) ([[VMLocalization shared] localizedString:key])
-#define GITHUB_API_URL @"https://api.github.com/repos/vaenshine/VansonMod/releases/latest"
+#define GITHUB_API_URL @"https://api.github.com/repos/SoulRune/VansonMod/releases/latest"
 
 @implementation VMUpdateManager
 

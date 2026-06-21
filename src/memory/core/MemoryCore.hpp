@@ -82,7 +82,7 @@ public:
 
   std::vector<ScanResult> scan(DataType type, const std::string &valueStr,
                                int searchMode, uint64_t start = 0,
-                               uint64_t end = 0);
+                               uint64_t end = 0, bool append = false);
 
   std::vector<ScanResult>
   nextScan(const std::vector<ScanResult> &previousResults, DataType type,

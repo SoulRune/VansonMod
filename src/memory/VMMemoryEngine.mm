@@ -641,14 +641,87 @@ static void autoSearchProgressBridge(VMCore::MemoryCore::SearchProgress sp,
                  fuzzyType:(VMFuzzyType)fuzzyType
               isNextSearch:(BOOL)isNext
                 completion:(void (^)(NSUInteger count, NSString *msg))comp {
-  
-  VMCore::DataType coreType = convertToCoreDataType(type);
+
   [self scanMemoryWithMode:mode
                     valStr:valStr
-              coreDataType:(uint8_t)coreType
+                 dataTypes:@[ @(type) ]
                  fuzzyType:fuzzyType
               isNextSearch:isNext
                 completion:comp];
+}
+
+- (void)scanMemoryWithMode:(VMSearchMode)mode
+                    valStr:(NSString *)valStr
+                 dataTypes:(NSArray<NSNumber *> *)types
+                 fuzzyType:(VMFuzzyType)fuzzyType
+              isNextSearch:(BOOL)isNext
+                completion:(void (^)(NSUInteger count, NSString *msg))comp {
+
+  if (self.targetTask == MACH_PORT_NULL) {
+    if (comp)
+      comp(0, TR(@"Msg_Target_Not_Found"));
+    return;
+  }
+  if (types.count == 0) {
+    if (comp)
+      comp(0, TR(@"Msg_Search_No_Res"));
+    return;
+  }
+
+  VMDataType primary = (VMDataType)[types.firstObject unsignedIntegerValue];
+  self.currentDataType = primary;
+
+  // Snapshot of the list of types in C++ for a background thread
+  std::vector<VMCore::DataType> coreTypes;
+  coreTypes.reserve(types.count);
+  for (NSNumber *t in types) {
+    coreTypes.push_back(convertToCoreDataType((VMDataType)[t unsignedIntegerValue]));
+  }
+
+  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+    std::string cValStr = [valStr UTF8String] ?: "";
+    int cMode = (int)mode;
+
+    if (isNext) {
+      int finalMode;
+      if (mode == VMSearchModeExact) {
+        finalMode = 100;
+      } else if (mode == VMSearchModeBetween) {
+        finalMode = 101;
+      } else if (mode == VMSearchModeFuzzy) {
+        finalMode = (int)fuzzyType;
+      } else {
+        finalMode = cMode;
+      }
+      // Core re-checks each result by its own stored type - representative type isn't critical
+      _core->nextScan({}, coreTypes.front(), cValStr, finalMode);
+    } else {
+      _core->clearBaselineSnapshot();
+
+      // First scan: iterate each type, appending results into one set
+      bool first = true;
+      for (VMCore::DataType ct : coreTypes) {
+        _core->scan(ct, cValStr, cMode, self.searchRangeStart,
+                    self.searchRangeEnd, /*append=*/!first);
+        first = false;
+      }
+
+      if (mode == VMSearchModeFuzzy && _core->getResultCount() > 0) {
+        _core->saveBaselineSnapshot();
+      }
+    }
+
+    self.resultCount = _core->getResultCount();
+    self.resultFilePath = self.resultCount > 0 ? [self getPathA] : nil;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (comp) {
+        NSString *msg = self.resultCount > 0 ? TR(@"Msg_Search_Success")
+                                             : TR(@"Msg_Search_No_Res");
+        comp(self.resultCount, msg);
+      }
+    });
+  });
 }
 
 - (void)scanMemoryWithMode:(VMSearchMode)mode
@@ -822,7 +895,7 @@ static void autoSearchProgressBridge(VMCore::MemoryCore::SearchProgress sp,
   item.address = cppItem.address;
   
   VMDataType actualType = (VMDataType)cppItem.type;
-  if (actualType >= VMDataTypeInt8 && actualType <= VMDataTypeDouble) {
+  if (actualType >= VMDataTypeInt8 && actualType <= VMDataTypeString) {
     item.type = actualType;
   } else {
     item.type = type;

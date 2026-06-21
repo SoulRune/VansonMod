@@ -30,7 +30,11 @@ extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 @property(nonatomic, strong) UIButton *searchBtn;
 @property(nonatomic, strong) UIButton *nearbyBtn;
 @property(nonatomic, strong) UIButton *resetBtn;
-@property(nonatomic, strong) UISegmentedControl *dataTypeSegment;
+@property(nonatomic, strong) UISegmentedControl *dataTypeSegment;  // hidden backing-storage of the primary type
+@property(nonatomic, strong) UISegmentedControl *typeModeSegment;  // [Auto | Manual]
+@property(nonatomic, strong) UIButton *typeSummaryButton;          // shows the current selection of types
+@property(nonatomic, assign) BOOL autoTypeMode;                    // YES = Auto (input types)
+@property(nonatomic, strong) NSArray<NSNumber *> *selectedTypes;   // selected types in the Manual
 @property(nonatomic, strong) UISegmentedControl *searchModeSegment;
 @property(nonatomic, strong) UISegmentedControl *fuzzySegRow1;
 @property(nonatomic, strong) UISegmentedControl *fuzzySegRow2;
@@ -66,9 +70,157 @@ extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
     NSMutableDictionary<NSNumber *, NSString *> *inputHistory;
 @property(nonatomic, assign) NSInteger previousModeIndex;
 @property(nonatomic, strong) UIActivityIndicatorView *btnSpinner;
-@property(nonatomic, assign) BOOL isFuzzyLocked; 
-@property(nonatomic, assign) NSInteger fuzzySearchCount; 
+@property(nonatomic, assign) BOOL isFuzzyLocked;
+@property(nonatomic, assign) NSInteger fuzzySearchCount;
 @end
+
+#pragma mark - VMReselectSegmentedControl (fires valueChanged even on re-tap)
+
+// UISegmentedControl doesn't emit valueChanged when the already-selected segment
+// is tapped again. This subclass re-sends it so tapping "Manual" reopens the list.
+@interface VMReselectSegmentedControl : UISegmentedControl
+@end
+
+@implementation VMReselectSegmentedControl
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+  NSInteger prev = self.selectedSegmentIndex;
+  [super touchesEnded:touches withEvent:event];
+  UITouch *t = touches.anyObject;
+  if (t && CGRectContainsPoint(self.bounds, [t locationInView:self]) &&
+      self.selectedSegmentIndex == prev) {
+    [self sendActionsForControlEvents:UIControlEventValueChanged];
+  }
+}
+@end
+
+#pragma mark - VMTypeMultiSelectVC (slide-up type selection list)
+
+@interface VMTypeMultiSelectVC : UITableViewController
+@property(nonatomic, strong) NSArray<NSString *> *typeNames;        // 11 short codes (I8, F32, ...)
+@property(nonatomic, strong) NSArray<NSString *> *fullNames;        // full names (Int 32-bit, ...)
+@property(nonatomic, strong) NSMutableSet<NSNumber *> *selectedSet; // VMDataType indexes
+@property(nonatomic, strong) NSSet<NSNumber *> *disabledSet;        // unavailable (Str)
+@property(nonatomic, assign) BOOL singleSelect;                     // fuzzy/group: pick only one type
+@property(nonatomic, copy) void (^onDone)(NSArray<NSNumber *> *types);
+@end
+
+@implementation VMTypeMultiSelectVC
+- (instancetype)init {
+  return [super initWithStyle:UITableViewStyleInsetGrouped];
+}
+- (void)viewDidLoad {
+  [super viewDidLoad];
+  self.navigationItem.rightBarButtonItem =
+      [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                    target:self
+                                                    action:@selector(doneTapped)];
+  // "Select all / Clear" only make sense in multi-select mode
+  if (!self.singleSelect) {
+    self.navigationItem.leftBarButtonItems = @[
+      [[UIBarButtonItem alloc] initWithTitle:TR(@"Batch_Sel_All")
+                                       style:UIBarButtonItemStylePlain
+                                      target:self
+                                      action:@selector(selectAllTapped)],
+      [[UIBarButtonItem alloc] initWithTitle:TR(@"Mod_Type_Clear")
+                                       style:UIBarButtonItemStylePlain
+                                      target:self
+                                      action:@selector(clearAllTapped)]
+    ];
+  }
+}
+- (void)doneTapped {
+  NSArray<NSNumber *> *sorted = [[self.selectedSet allObjects]
+      sortedArrayUsingSelector:@selector(compare:)];
+  if (self.onDone)
+    self.onDone(sorted);
+  [self dismissViewControllerAnimated:YES completion:nil];
+}
+- (void)selectAllTapped {
+  for (NSInteger i = 0; i < (NSInteger)self.typeNames.count; i++) {
+    if (![self.disabledSet containsObject:@(i)])
+      [self.selectedSet addObject:@(i)];
+  }
+  [self.tableView reloadData];
+}
+- (void)clearAllTapped {
+  [self.selectedSet removeAllObjects];
+  [self.tableView reloadData];
+}
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+  return self.typeNames.count;
+}
+- (UITableViewCell *)tableView:(UITableView *)tableView
+         cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+  static NSString *cid = @"typecell";
+  UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cid];
+  if (!cell)
+    cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
+                                  reuseIdentifier:cid];
+  NSInteger row = indexPath.row;
+  NSString *code = self.typeNames[row];
+  NSString *full = (row < (NSInteger)self.fullNames.count) ? self.fullNames[row] : @"";
+  BOOL disabled = [self.disabledSet containsObject:@(row)];
+
+  // Single line: short code, then full name aligned in a column via a tab stop
+  UIColor *codeColor = disabled ? [UIColor tertiaryLabelColor] : [UIColor labelColor];
+  UIColor *fullColor = disabled ? [UIColor quaternaryLabelColor] : [UIColor secondaryLabelColor];
+  NSMutableParagraphStyle *ps = [[NSMutableParagraphStyle alloc] init];
+  ps.tabStops = @[ [[NSTextTab alloc] initWithTextAlignment:NSTextAlignmentLeft
+                                                   location:60
+                                                    options:@{}] ];
+  ps.defaultTabInterval = 60;
+  ps.lineBreakMode = NSLineBreakByTruncatingTail;
+  NSString *combined = [NSString stringWithFormat:@"%@\t%@", code, full];
+  NSMutableAttributedString *att =
+      [[NSMutableAttributedString alloc] initWithString:combined];
+  [att addAttribute:NSParagraphStyleAttributeName
+              value:ps
+              range:NSMakeRange(0, combined.length)];
+  [att addAttributes:@{
+    NSFontAttributeName : [UIFont monospacedSystemFontOfSize:16 weight:UIFontWeightSemibold],
+    NSForegroundColorAttributeName : codeColor
+  } range:NSMakeRange(0, code.length)];
+  [att addAttributes:@{
+    NSFontAttributeName : [UIFont systemFontOfSize:14 weight:UIFontWeightRegular],
+    NSForegroundColorAttributeName : fullColor
+  } range:NSMakeRange(code.length, combined.length - code.length)];
+  cell.textLabel.attributedText = att;
+
+  if (disabled) {
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    cell.accessoryType = UITableViewCellAccessoryNone;
+  } else {
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    cell.accessoryType = [self.selectedSet containsObject:@(row)]
+                             ? UITableViewCellAccessoryCheckmark
+                             : UITableViewCellAccessoryNone;
+  }
+  return cell;
+}
+- (void)tableView:(UITableView *)tableView
+    didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+  [tableView deselectRowAtIndexPath:indexPath animated:YES];
+  if ([self.disabledSet containsObject:@(indexPath.row)])
+    return;
+  NSNumber *idx = @(indexPath.row);
+  if (self.singleSelect) {
+    // Pick exactly one type (fuzzy/group); ignore re-tap on the same row
+    if ([self.selectedSet containsObject:idx])
+      return;
+    [self.selectedSet removeAllObjects];
+    [self.selectedSet addObject:idx];
+    [tableView reloadData];
+    return;
+  }
+  if ([self.selectedSet containsObject:idx])
+    [self.selectedSet removeObject:idx];
+  else
+    [self.selectedSet addObject:idx];
+  [tableView reloadRowsAtIndexPaths:@[ indexPath ]
+                   withRowAnimation:UITableViewRowAnimationNone];
+}
+@end
+
 @implementation VMModifierViewController
 - (void)viewDidLoad {
   [super viewDidLoad];
@@ -130,8 +282,13 @@ extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 
     self.navigationItem.leftBarButtonItems = nil;
 
-    self.dataTypeSegment.selectedSegmentIndex = 3;
+    // The search for pointers is always by I64 - fix the type and hide the Auto/Manual selection
+    self.autoTypeMode = NO;
+    self.selectedTypes = @[ @(VMDataTypeInt64) ];
+    self.dataTypeSegment.selectedSegmentIndex = VMDataTypeInt64;
     self.dataTypeSegment.enabled = NO;
+    self.typeModeSegment.hidden = YES;
+    self.typeSummaryButton.hidden = YES;
   }
 }
 
@@ -191,7 +348,9 @@ extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
     self.searchModeSegment.selectedSegmentIndex = self.initialSearchMode;
     [self modeChanged];
 
-    self.dataTypeSegment.selectedSegmentIndex = 3;
+    self.autoTypeMode = NO;
+    self.selectedTypes = @[ @(VMDataTypeInt64) ];
+    self.dataTypeSegment.selectedSegmentIndex = VMDataTypeInt64;
     [self dataTypeChanged];
 
     self.inputField.text = self.initialSearchVal;
@@ -361,16 +520,40 @@ extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
   [searchRow addArrangedSubview:self.searchBtn];
   [self.headerMainStack addArrangedSubview:searchRow];
 
+  // Hidden backing-storage of the "primary" type - a filter,
+  // nearby, group, pointer-mode etc. are tied to it. Visible selection is made via Auto/Manual.
   self.dataTypeSegment = [[UISegmentedControl alloc]
       initWithItems:@[ @"I8", @"I16", @"I32", @"I64", @"U8", @"U16", @"U32", @"U64", @"F32", @"F64", @"Str" ]];
-  self.dataTypeSegment.selectedSegmentIndex = 2; 
+  self.dataTypeSegment.selectedSegmentIndex = 2;
   [self.dataTypeSegment addTarget:self
                            action:@selector(dataTypeChanged)
                  forControlEvents:UIControlEventValueChanged];
-  [self.dataTypeSegment.heightAnchor constraintEqualToConstant:32].active = YES;
-  
-  [self.dataTypeSegment setTitleTextAttributes:@{NSFontAttributeName: [UIFont systemFontOfSize:11]} forState:UIControlStateNormal];
+  self.dataTypeSegment.hidden = YES;  // hidden, remains only as a state
   [self.headerMainStack addArrangedSubview:self.dataTypeSegment];
+
+  // Visible type selection control: [Auto | Manual]
+  self.typeModeSegment = [[VMReselectSegmentedControl alloc]
+      initWithItems:@[ TR(@"Mod_Type_Auto"), TR(@"Mod_Type_Manual") ]];
+  self.typeModeSegment.selectedSegmentIndex = 0;  // by default, Auto
+  [self.typeModeSegment addTarget:self
+                           action:@selector(typeModeChanged)
+                 forControlEvents:UIControlEventValueChanged];
+  [self.typeModeSegment.heightAnchor constraintEqualToConstant:32].active = YES;
+  [self.headerMainStack addArrangedSubview:self.typeModeSegment];
+
+  // Signature/button with the current type selection (tap → selection list)
+  self.typeSummaryButton = [UIButton buttonWithType:UIButtonTypeSystem];
+  self.typeSummaryButton.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+  self.typeSummaryButton.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
+  [self.typeSummaryButton addTarget:self
+                             action:@selector(openTypeSelectList)
+                   forControlEvents:UIControlEventTouchUpInside];
+  [self.typeSummaryButton.heightAnchor constraintEqualToConstant:24].active = YES;
+  [self.headerMainStack addArrangedSubview:self.typeSummaryButton];
+
+  self.autoTypeMode = YES;
+  self.selectedTypes = @[ @(VMDataTypeInt32), @(VMDataTypeFloat) ];
+  [self updateTypeSummary];
 
   self.fuzzySegRow1 = [[UISegmentedControl alloc] initWithItems:@[
     TR(@"Fuz_Increased"), TR(@"Fuz_Decreased"), TR(@"Fuz_Unchanged"),
@@ -872,10 +1055,15 @@ extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
     }
   }
   [self updateGroupHelpButtonState:(newMode == 2)];
+  // Str is only available in exact mode - in fuzzy/group mode, we remove it from the selection.
   BOOL allowString = (newMode == 0);
-  [self.dataTypeSegment setEnabled:allowString forSegmentAtIndex:VMDataTypeString];
-  if (!allowString && self.dataTypeSegment.selectedSegmentIndex == VMDataTypeString) {
-    self.dataTypeSegment.selectedSegmentIndex = VMDataTypeInt32;
+  if (!allowString && !self.autoTypeMode && [self.selectedTypes containsObject:@(VMDataTypeString)]) {
+    NSMutableArray *clean = [self.selectedTypes mutableCopy];
+    [clean removeObject:@(VMDataTypeString)];
+    if (clean.count == 0)
+      clean = [@[ @(VMDataTypeInt32) ] mutableCopy];
+    self.selectedTypes = clean;
+    [self updateTypeSummary];
   }
   [self.inputField reloadInputViews];
 
@@ -1271,6 +1459,199 @@ extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
                  }];
 }
 
+#pragma mark - Type selection (Auto / Manual)
+
+static NSString *VMShortTypeName(VMDataType t) {
+  switch (t) {
+    case VMDataTypeInt8: return @"I8";
+    case VMDataTypeInt16: return @"I16";
+    case VMDataTypeInt32: return @"I32";
+    case VMDataTypeInt64: return @"I64";
+    case VMDataTypeUInt8: return @"U8";
+    case VMDataTypeUInt16: return @"U16";
+    case VMDataTypeUInt32: return @"U32";
+    case VMDataTypeUInt64: return @"U64";
+    case VMDataTypeFloat: return @"F32";
+    case VMDataTypeDouble: return @"F64";
+    case VMDataTypeString: return @"Str";
+    default: return @"I32";
+  }
+}
+
+- (NSString *)shortTypeName:(VMDataType)t {
+  return VMShortTypeName(t);
+}
+
+// The primary type is for single-type operations (filter, nearby, group, display)
+- (VMDataType)primaryType {
+  if (!self.autoTypeMode && self.selectedTypes.count > 0)
+    return (VMDataType)[self.selectedTypes.firstObject unsignedIntegerValue];
+  return VMDataTypeInt32;
+}
+
+// Str is not available in the fuzzy/group
+- (BOOL)isStringAllowed {
+  return self.searchModeSegment.selectedSegmentIndex == 0;  // accurate only
+}
+
+- (void)updateTypeSummary {
+  NSString *text;
+  if (self.autoTypeMode) {
+    text = TR(@"Mod_Type_Auto_Hint");
+  } else if (self.selectedTypes.count == 0) {
+    text = TR(@"Mod_Type_Manual");
+  } else {
+    NSMutableArray *names = [NSMutableArray array];
+    for (NSNumber *n in self.selectedTypes)
+      [names addObject:VMShortTypeName((VMDataType)n.unsignedIntegerValue)];
+    text = [names componentsJoinedByString:@", "];
+  }
+  [self.typeSummaryButton setTitle:text forState:UIControlStateNormal];
+  // Mirroring the primary type to a hidden backing-segment
+  self.dataTypeSegment.selectedSegmentIndex = [self primaryType];
+}
+
+- (void)typeModeChanged {
+  if (self.typeModeSegment.selectedSegmentIndex == 0) {
+    self.autoTypeMode = YES;
+    [self updateTypeSummary];
+  } else {
+    self.autoTypeMode = NO;
+    if (self.selectedTypes.count == 0)
+      self.selectedTypes = @[ @(VMDataTypeInt32) ];
+    [self updateTypeSummary];
+    [self openTypeSelectList];
+  }
+}
+
+- (void)openTypeSelectList {
+  VMTypeMultiSelectVC *vc = [[VMTypeMultiSelectVC alloc] init];
+  vc.title = TR(@"Mod_Type_Select_Title");
+  vc.typeNames = @[ @"I8", @"I16", @"I32", @"I64", @"U8", @"U16", @"U32", @"U64", @"F32", @"F64", @"Str" ];
+  // GameGuardian-style full names — always English (Byte/Word/Dword/Qword/...)
+  vc.fullNames = @[
+    @"Byte", @"Word", @"Dword", @"Qword",
+    @"Byte (unsigned)", @"Word (unsigned)", @"Dword (unsigned)", @"Qword (unsigned)",
+    @"Float", @"Double", @"Text"
+  ];
+  // Fuzzy/group are single-type — let the user pick only one
+  BOOL single = (self.searchModeSegment.selectedSegmentIndex != 0);
+  vc.singleSelect = single;
+
+  vc.selectedSet = [NSMutableSet set];
+  if (single) {
+    // Seed with one type (the representative / first selected)
+    [vc.selectedSet addObject:@([self representativeTypeForInput:self.inputField.text
+                                                            mode:(VMSearchMode)self.searchModeSegment.selectedSegmentIndex])];
+  } else {
+    for (NSNumber *n in self.selectedTypes)
+      [vc.selectedSet addObject:n];
+  }
+  NSMutableSet *disabled = [NSMutableSet set];
+  if (![self isStringAllowed])
+    [disabled addObject:@(VMDataTypeString)];
+  vc.disabledSet = disabled;
+
+  __weak __typeof(self) ws = self;
+  vc.onDone = ^(NSArray<NSNumber *> *types) {
+    [ws applyManualTypes:types];
+  };
+
+  UINavigationController *nav =
+      [[UINavigationController alloc] initWithRootViewController:vc];
+  nav.modalPresentationStyle = UIModalPresentationPageSheet;
+  [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)applyManualTypes:(NSArray<NSNumber *> *)types {
+  NSMutableArray *clean = [types mutableCopy];
+  if (![self isStringAllowed])
+    [clean removeObject:@(VMDataTypeString)];
+  if (clean.count == 0)
+    clean = [@[ @(VMDataTypeInt32) ] mutableCopy];
+  self.selectedTypes = clean;
+  self.autoTypeMode = NO;
+  self.typeModeSegment.selectedSegmentIndex = 1;
+  [self updateTypeSummary];
+  [self dataTypeChanged];
+}
+
+// Automatic detection of a set of types by the entered value (as in GameGuardian)
+- (NSArray<NSNumber *> *)autoTypesForInput:(NSString *)val mode:(VMSearchMode)mode {
+  NSString *t = [val stringByTrimmingCharactersInSet:
+                          [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  if (t.length == 0)
+    return @[ @(VMDataTypeInt32), @(VMDataTypeFloat) ];
+
+  NSCharacterSet *allowed = [NSCharacterSet
+      characterSetWithCharactersInString:@"0123456789.,~-+ ，～"];
+  BOOL isNumeric =
+      ([t rangeOfCharacterFromSet:[allowed invertedSet]].location == NSNotFound);
+
+  if (!isNumeric) {
+    // Text - search as a string (only in the exact mode)
+    if (mode == VMSearchModeExact)
+      return @[ @(VMDataTypeString) ];
+    return @[ @(VMDataTypeInt32) ];
+  }
+  if ([t containsString:@"."])
+    return @[ @(VMDataTypeFloat), @(VMDataTypeDouble) ];
+  return @[
+    @(VMDataTypeInt8), @(VMDataTypeInt16), @(VMDataTypeInt32), @(VMDataTypeInt64),
+    @(VMDataTypeUInt8), @(VMDataTypeUInt16), @(VMDataTypeUInt32), @(VMDataTypeUInt64)
+  ];
+}
+
+// One representative type is for single-type operations (fast-fuzzy, group,
+// nearby, filter, input validation, backing-segment)
+- (VMDataType)representativeTypeForInput:(NSString *)val mode:(VMSearchMode)mode {
+  if (!self.autoTypeMode && self.selectedTypes.count > 0) {
+    VMDataType first = (VMDataType)[self.selectedTypes.firstObject unsignedIntegerValue];
+    if (first == VMDataTypeString && mode != VMSearchModeExact)
+      return VMDataTypeInt32;
+    return first;
+  }
+  // Auto: a reasonable default on input
+  NSString *t = [val stringByTrimmingCharactersInSet:
+                          [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  if (t.length == 0)
+    return VMDataTypeInt32;
+  if ([t containsString:@"."])
+    return VMDataTypeFloat;
+  NSCharacterSet *allowed = [NSCharacterSet
+      characterSetWithCharactersInString:@"0123456789.,~-+ ，～"];
+  BOOL isNumeric =
+      ([t rangeOfCharacterFromSet:[allowed invertedSet]].location == NSNotFound);
+  if (!isNumeric && mode == VMSearchModeExact)
+    return VMDataTypeString;
+  return VMDataTypeInt32;
+}
+
+// The final list of types to search for (taking into account the mode)
+- (NSArray<NSNumber *> *)resolveSearchTypesForMode:(VMSearchMode)mode
+                                             input:(NSString *)val {
+  // Group and fuzzy are single-type kernel operations (group parser/ fast-fuzzy)
+  if (mode == VMSearchModeGroup || mode == VMSearchModeFuzzy)
+    return @[ @([self representativeTypeForInput:val mode:mode]) ];
+
+  NSMutableArray<NSNumber *> *types;
+  if (self.autoTypeMode)
+    types = [[self autoTypesForInput:val mode:mode] mutableCopy];
+  else
+    types = [self.selectedTypes mutableCopy];
+
+  if (types.count == 0)
+    types = [@[ @(VMDataTypeInt32) ] mutableCopy];
+
+  // Str is only allowed in exact mode
+  if (mode != VMSearchModeExact)
+    [types removeObject:@(VMDataTypeString)];
+  if (types.count == 0)
+    types = [@[ @(VMDataTypeInt32) ] mutableCopy];
+
+  return types;
+}
+
 - (void)dataTypeChanged {
   VMDataType type = (VMDataType)self.dataTypeSegment.selectedSegmentIndex;
   NSInteger mode = self.searchModeSegment.selectedSegmentIndex;
@@ -1498,6 +1879,11 @@ extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
       mode = VMSearchModeBetween;
     }
   }
+
+  // Search type list (Auto/Manual) + primary type for single-type operations
+  NSArray<NSNumber *> *searchTypes = [self resolveSearchTypesForMode:mode input:valStr];
+  self.dataTypeSegment.selectedSegmentIndex = [self representativeTypeForInput:valStr mode:mode];
+  type = (VMDataType)self.dataTypeSegment.selectedSegmentIndex;
 
   NSInteger fIdx = 3;
   if (mode == VMSearchModeFuzzy) {
@@ -1759,7 +2145,7 @@ extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
   [[VMMemoryEngine shared]
       scanMemoryWithMode:mode
                   valStr:valStr
-                dataType:type
+               dataTypes:searchTypes
                fuzzyType:fType
             isNextSearch:self.isNextScan
               completion:^(NSUInteger count, NSString *msg) {
@@ -2438,7 +2824,7 @@ extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
     VMScanResultItem *itm = [self getItemAtIndexPath:p];
     if (itm) {
       VMDataType type = itm.type;
-      if (type < VMDataTypeInt8 || type > VMDataTypeDouble) {
+      if (type < VMDataTypeInt8 || type > VMDataTypeString) {
         type = (VMDataType)self.dataTypeSegment.selectedSegmentIndex;
       }
       NSMutableDictionary *favItem =
@@ -2475,7 +2861,7 @@ extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
         continue;
 
       VMDataType type = itm.type;
-      if (type < VMDataTypeInt8 || type > VMDataTypeDouble) {
+      if (type < VMDataTypeInt8 || type > VMDataTypeString) {
         type = (VMDataType)self.dataTypeSegment.selectedSegmentIndex;
       }
       
@@ -2777,6 +3163,7 @@ extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
     }
 
     [displayText appendFormat:@"0x%llX", item.address];
+    [displayText appendFormat:@"  ·  %@", [self shortTypeName:item.type]];
 
     cell.textLabel.text = displayText;
     cell.textLabel.numberOfLines = 1;
@@ -2806,7 +3193,7 @@ extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
     }
 
     VMDataType displayType = item.type;
-    if (displayType < VMDataTypeInt8 || displayType > VMDataTypeDouble) {
+    if (displayType < VMDataTypeInt8 || displayType > VMDataTypeString) {
       if (self.dataTypeSegment.selectedSegmentIndex != UISegmentedControlNoSegment) {
         displayType = (VMDataType)self.dataTypeSegment.selectedSegmentIndex;
       } else {
@@ -2883,7 +3270,7 @@ extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
     return;
 
   VMDataType type = item.type;
-  if (type < VMDataTypeInt8 || type > VMDataTypeDouble) {
+  if (type < VMDataTypeInt8 || type > VMDataTypeString) {
     if (self.dataTypeSegment.selectedSegmentIndex != UISegmentedControlNoSegment) {
       type = (VMDataType)self.dataTypeSegment.selectedSegmentIndex;
     } else {
@@ -2966,7 +3353,7 @@ extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
                                   void (^completion)(BOOL)) {
                           
                           VMDataType type = item.type;
-                          if (type < VMDataTypeInt8 || type > VMDataTypeDouble) {
+                          if (type < VMDataTypeInt8 || type > VMDataTypeString) {
                             if (self.dataTypeSegment.selectedSegmentIndex != UISegmentedControlNoSegment) {
                               type = (VMDataType)self.dataTypeSegment.selectedSegmentIndex;
                             } else {
@@ -2995,7 +3382,7 @@ extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
                                   void (^completion)(BOOL)) {
                           
                           VMDataType type = item.type;
-                          if (type < VMDataTypeInt8 || type > VMDataTypeDouble) {
+                          if (type < VMDataTypeInt8 || type > VMDataTypeString) {
                             if (self.dataTypeSegment.selectedSegmentIndex != UISegmentedControlNoSegment) {
                               type = (VMDataType)self.dataTypeSegment.selectedSegmentIndex;
                             } else {

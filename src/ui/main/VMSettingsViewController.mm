@@ -616,7 +616,7 @@
 
     if (indexPath.row == 0) {  
       cell.textLabel.text = TR(@"Set_Github");
-      cell.detailTextLabel.text = @"Vaenshine";
+      cell.detailTextLabel.text = @"SoulRune";
       cell.imageView.image =
           [VMIconHelper compatibleSystemImageNamed:
                             @"chevron.left.forwardslash.chevron.right"];
@@ -737,7 +737,7 @@
       [[UIApplication sharedApplication]
                     openURL:[NSURL
                                 URLWithString:
-                                    @"https://github.com/vaenshine/VansonMod/"]
+                                    @"https://github.com/SoulRune/VansonMod/"]
                     options:@{}
           completionHandler:nil];
     else if (indexPath.row == 1)

@@ -150,6 +150,16 @@ typedef enum : NSUInteger {
               isNextSearch:(BOOL)isNext
                 completion:(void (^)(NSUInteger count, NSString *msg))comp;
 
+// Multi-type: in one logical search, it goes through several types
+// (the first scan adds the results of each type to one set).
+// The results are mixed - each stores its own type; next/filter is checked per-item.
+- (void)scanMemoryWithMode:(VMSearchMode)mode
+                    valStr:(NSString *)valStr
+                 dataTypes:(NSArray<NSNumber *> *)types
+                 fuzzyType:(VMFuzzyType)fuzzyType
+              isNextSearch:(BOOL)isNext
+                completion:(void (^)(NSUInteger count, NSString *msg))comp;
+
 - (void)scanMemoryWithMode:(VMSearchMode)mode
                     valStr:(NSString *)valStr
               coreDataType:(uint8_t)coreType

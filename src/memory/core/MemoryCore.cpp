@@ -494,12 +494,14 @@ void MemoryCore::parseRangeString(const std::string &rangeStr, DataType type,
 std::vector<ScanResult> MemoryCore::scan(DataType type,
                                          const std::string &valueStr,
                                          int searchMode, uint64_t start,
-                                         uint64_t end) {
-  _resultCount = 0;
+                                         uint64_t end, bool append) {
+  if (!append)
+    _resultCount = 0;
   std::vector<ScanResult> emptyRes;
   if (_task == MACH_PORT_NULL || _storagePath.empty())
     return emptyRes;
-  FILE *outFile = fopen(_storagePath.c_str(), "wb");
+  // append=true: add the following type of results to the same file (multi-type)
+  FILE *outFile = fopen(_storagePath.c_str(), append ? "ab" : "wb");
   if (!outFile)
     return emptyRes;
 
@@ -976,54 +978,46 @@ MemoryCore::nextScan(const std::vector<ScanResult> &ignored, DataType type,
     }
   }
 
-  union {
-    int8_t i8;
-    int16_t i16;
-    int32_t i32;
-    int64_t i64;
-    float f;
-    double d;
-  } target;
-  memset(&target, 0, sizeof(target));
-  
-  parseValue(valueStr, type, &target);
-  
-  // Parse range for between mode (101)
-  union {
-    int8_t i8; int16_t i16; int32_t i32; int64_t i64;
-    float f; double d;
-  } rangeMin, rangeMax;
-  memset(&rangeMin, 0, sizeof(rangeMin));
-  memset(&rangeMax, 0, sizeof(rangeMax));
+  // Multi-type: we parse the target for all widths at once, so that each result is
+  // checked against ITS stored type (raw.type), and not against requestedType.
+  int64_t targetIntRaw = 0;
+  double targetDoubleRaw = 0;
+  parseValue(valueStr, DataType::Int64, &targetIntRaw);
+  parseValue(valueStr, DataType::Double, &targetDoubleRaw);
+
+  // Parse range for between mode (101) - separate integer and real numbers
+  int64_t rangeMinIntRaw = 0, rangeMaxIntRaw = 0;
+  double rangeMinDoubleRaw = 0, rangeMaxDoubleRaw = 0;
   if (searchMode == 101) {
-    parseRangeString(valueStr, type, &rangeMin, &rangeMax);
+    parseRangeString(valueStr, DataType::Int64, &rangeMinIntRaw, &rangeMaxIntRaw);
+    parseRangeString(valueStr, DataType::Double, &rangeMinDoubleRaw, &rangeMaxDoubleRaw);
   }
-  
+
   bool isStringType = (type == DataType::String);
   std::string targetString = valueStr;
   size_t targetStringLen = targetString.length();
 
   std::atomic<size_t> newCount(0);
   mach_port_t task = _task;
-  
-  float targetFloat = target.f;
-  double targetDouble = target.d;
-  
-  int8_t targetI8 = target.i8;
-  int16_t targetI16 = target.i16;
-  int32_t targetI32 = target.i32;
-  int64_t targetI64 = target.i64;
+
+  float targetFloat = (float)targetDoubleRaw;
+  double targetDouble = targetDoubleRaw;
+
+  int8_t targetI8 = (int8_t)targetIntRaw;
+  int16_t targetI16 = (int16_t)targetIntRaw;
+  int32_t targetI32 = (int32_t)targetIntRaw;
+  int64_t targetI64 = targetIntRaw;
   double floatTolerance = _floatTolerance;
-  
+
   std::vector<DiffRegion> diffRegionsCopy = diffRegions;
   bool useIncremental = useIncrementalOptimization;
-  
+
   // Range variables for between mode (101)
-  float rangeMinFloat = rangeMin.f, rangeMaxFloat = rangeMax.f;
-  double rangeMinDouble = rangeMin.d, rangeMaxDouble = rangeMax.d;
-  int64_t rangeMinI64 = rangeMin.i64, rangeMaxI64 = rangeMax.i64;
-  
-  DataType requestedType = type;  
+  float rangeMinFloat = (float)rangeMinDoubleRaw, rangeMaxFloat = (float)rangeMaxDoubleRaw;
+  double rangeMinDouble = rangeMinDoubleRaw, rangeMaxDouble = rangeMaxDoubleRaw;
+  int64_t rangeMinI64 = rangeMinIntRaw, rangeMaxI64 = rangeMaxIntRaw;
+
+  (void)isStringType;  // stringiness is determined by per-item by raw.type
 
   const size_t chunkSizeInResults = 500000;
   size_t processed = 0;
@@ -1081,8 +1075,8 @@ MemoryCore::nextScan(const std::vector<ScanResult> &ignored, DataType type,
             }
             
             uint8_t buf[8];
-            
-            if (isStringType) {
+
+            if ((DataType)raw.type == DataType::String) {
               mach_vm_size_t rSz = 64;
               if (mach_vm_read_overwrite(task, raw.address, 64,
                                          (mach_vm_address_t)stringBuffer,
@@ -1133,13 +1127,8 @@ MemoryCore::nextScan(const std::vector<ScanResult> &ignored, DataType type,
               }
             }
 
-            DataType storedType = (DataType)raw.type;
-            DataType actualType = storedType;
+            DataType actualType = (DataType)raw.type;
             size_t actualSize = getSizeForType(actualType);
-            
-            if (storedType != requestedType) {
-              continue;
-            }
 
             bool readSuccess = false;
             if (cachedPage != (uint64_t)-1) {
@@ -1463,9 +1452,7 @@ MemoryCore::scanNearby(const std::vector<ScanResult> &baseResults,
       FILE *fOut = fopen(_swapPath.c_str(), "wb");
       if (fOut) {
         for (const auto &res : results) {
-          RawResult raw;
-          raw.address = res.address;
-          raw.value = res.value.u64;
+          RawResult raw = makeRawResult(res.address, res.value.u64, res.type);
           fwrite(&raw, sizeof(RawResult), 1, fOut);
         }
         fclose(fOut);
@@ -1840,7 +1827,7 @@ size_t MemoryCore::filterResults(FilterMode mode, DataType type,
   }
   RawResult item;
   size_t newCount = 0;
-  size_t dataSize = getSizeForType(type);
+  (void)type;  // the filter checks each result by its type (item.type)
 
   uint64_t cachedPage = (uint64_t)-1;
   uint8_t pageBuffer[4096];
@@ -1849,7 +1836,10 @@ size_t MemoryCore::filterResults(FilterMode mode, DataType type,
     uint8_t buf[8];
     memset(buf, 0, 8);
 
-    uint64_t pageAddr = item.address & ~0xFFF; 
+    DataType itemType = (DataType)item.type;
+    size_t dataSize = getSizeForType(itemType);
+
+    uint64_t pageAddr = item.address & ~0xFFF;
     if (pageAddr != cachedPage) {
       cachedPage = pageAddr;
       mach_vm_size_t readSz = 4096;
@@ -1881,9 +1871,9 @@ size_t MemoryCore::filterResults(FilterMode mode, DataType type,
 
     if (readSuccess) {
       double currentVal = 0;
-      if (type == DataType::Float)
+      if (itemType == DataType::Float)
         currentVal = *(float *)buf;
-      else if (type == DataType::Double)
+      else if (itemType == DataType::Double)
         currentVal = *(double *)buf;
       else if (dataSize == 1)
         currentVal = *(int8_t *)buf;
